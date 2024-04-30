@@ -1,7 +1,16 @@
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::collections::{HashMap, HashSet};
+use std::ops::Add;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
+use futures::channel::oneshot;
+use futures::executor::ThreadPool;
+
+use futures_timer::Delay;
+use rand::Rng;
 
 #[cfg(test)]
 pub mod config;
@@ -13,6 +22,7 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+use crate::raft::Role::{Candidate, Follower, Leader};
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -28,6 +38,13 @@ pub enum ApplyMsg {
         term: u64,
         index: u64,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Role {
+    Leader,
+    Follower,
+    Candidate,
 }
 
 /// State of a raft peer.
@@ -48,6 +65,11 @@ impl State {
     }
 }
 
+const BASIC_TIMEOUT_MS: u64 = 90;
+const RPC_RETRY: usize = 10;
+
+type AsyncOneshotSender<T> = oneshot::Sender<T>;
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -56,10 +78,20 @@ pub struct Raft {
     persister: Box<dyn Persister>,
     // this peer's index into peers[]
     me: usize,
-    state: Arc<State>,
+    term: u64,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
+    n: usize,
+    role: Role,
+    voted_terms: HashSet<u64>,
+    get_voted: HashMap<u64, HashSet<usize>>,
+    last_receive_heartbeat: Instant,
+    last_send_heartbeat: Instant,
+    remote_servers: Vec<usize>,
+    worker: ThreadPool,
+    tx: Sender<RaftMessage>,
+    rx: Receiver<RaftMessage>,
 }
 
 impl Raft {
@@ -78,19 +110,288 @@ impl Raft {
         apply_ch: UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
-
+        let n = peers.len();
+        let remote_servers = (0..n).filter(|&i| i != me).collect();
         // Your initialization code here (2A, 2B, 2C).
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut rf = Raft {
             peers,
             persister,
             me,
-            state: Arc::default(),
+            term: 0,
+            voted_terms: HashSet::new(),
+            get_voted: HashMap::new(),
+            role: Follower,
+            last_receive_heartbeat: Instant::now(),
+            last_send_heartbeat: Instant::now(),
+            n,
+            remote_servers,
+            worker: ThreadPool::new().unwrap(),
+            tx,
+            rx,
         };
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        crate::your_code_here((rf, apply_ch))
+        rf
+        //crate::your_code_here((rf, apply_ch))
+    }
+
+    fn run(&mut self) {
+        while let Ok(msg) = self.rx.recv() {
+            match msg {
+                RaftMessage::FollowerTimeout(duration) => {
+                    self.handle_follower_timeout(duration);
+                }
+                RaftMessage::LeaderTimeout(duration) => {
+                    self.handle_heartbeat_timeout(duration);
+                }
+                RaftMessage::VoteReply(vote_reply) => {
+                    self.handle_vote_reply(vote_reply);
+                }
+                RaftMessage::AppendReply(append_reply) => {
+                    self.handle_append_reply(append_reply);
+                }
+                RaftMessage::VoteRequest(request, tx) => {
+                    self.handle_vote_request(request, tx);
+                }
+                RaftMessage::AppendRequest(request, tx) => {
+                    self.handle_append_request(request, tx);
+                }
+                RaftMessage::QueryTerm(tx) => {
+                    let _ = tx.send(self.term);
+                }
+                RaftMessage::QueryLeader(tx) => {
+                    let _ = tx.send(self.is_leader());
+                }
+            }
+        }
+    }
+
+    fn new_tx(&self) -> Sender<RaftMessage> {
+        self.tx.clone()
+    }
+
+    fn handle_vote_request(
+        &mut self,
+        vote_request: RequestVoteArgs,
+        tx: AsyncOneshotSender<RequestVoteReply>,
+    ) {
+        if vote_request.term < self.term {
+            let _ = tx.send(RequestVoteReply {
+                id: self.me as u64,
+                term: self.term,
+                vote: false,
+            });
+            return;
+        }
+        if vote_request.term > self.term {
+            self.catch_up_term(vote_request.term);
+        }
+        let vote = if self.has_voted(self.term) {
+            false
+        } else {
+            self.vote_for(vote_request.id as usize);
+            true
+        };
+        let _ = tx.send(RequestVoteReply {
+            id: self.me as u64,
+            term: self.term,
+            vote,
+        });
+    }
+
+    fn has_voted(&self, term: u64) -> bool {
+        self.voted_terms.contains(&term)
+    }
+
+    fn handle_append_request(
+        &mut self,
+        append_request: AppendEntriesArgs,
+        tx: AsyncOneshotSender<AppendEntriesReply>,
+    ) {
+        if append_request.term < self.term {
+            let _ = tx.send(AppendEntriesReply {
+                id: self.me as u64,
+                term: self.term,
+                r#type: append_request.r#type,
+            });
+            return;
+        }
+        if append_request.term > self.term {
+            self.catch_up_term(append_request.term);
+        }
+        self.refresh_follower_timeout();
+        match append_request.r#type.into() {
+            RequestType::Heartbeat => {
+                let _ = tx.send(AppendEntriesReply {
+                    id: self.me as u64,
+                    term: self.term,
+                    r#type: append_request.r#type,
+                });
+            }
+        }
+    }
+
+    fn refresh_follower_timeout(&mut self) {
+        self.last_receive_heartbeat = Instant::now();
+    }
+
+    fn handle_follower_timeout(&mut self, duration: Duration) {
+        if self.is_leader() {
+            return;
+        }
+        let next_fire = self
+            .last_receive_heartbeat
+            .add(duration)
+            .checked_duration_since(Instant::now());
+        if let Some(next_fire) = next_fire {
+            let tx = self.new_tx();
+            self.worker.spawn_ok(async move {
+                Delay::new(next_fire).await;
+                let _ = tx.send(RaftMessage::FollowerTimeout(next_fire));
+            });
+        } else {
+            self.start_election();
+        }
+    }
+
+    fn handle_heartbeat_timeout(&mut self, _d: Duration) {
+        if !self.is_leader() {
+            return;
+        }
+        self.send_heartbeat();
+    }
+
+    fn start_election(&mut self) {
+        self.increase_term();
+        self.role = Candidate;
+        self.vote_for(self.me);
+
+        let vote_args = RequestVoteArgs {
+            id: self.me as u64,
+            term: self.term,
+        };
+        self.remote_servers
+            .iter()
+            .map(|&i| self.send_request_vote(i, vote_args.clone()))
+            .for_each(|rx| {
+                let tx = self.new_tx();
+                self.worker.spawn_ok(async move {
+                    let reply = rx.await;
+                    if let Ok(reply) = reply {
+                        let _ = tx.send(RaftMessage::VoteReply(reply));
+                    }
+                })
+            });
+    }
+
+    fn handle_vote_reply(&mut self, reply: RequestVoteReply) {
+        if reply.term < self.term {
+            return;
+        }
+        if reply.term > self.term {
+            self.catch_up_term(reply.term);
+            return;
+        }
+        if !self.is_candidate() {
+            return;
+        }
+        if reply.vote {
+            self.get_voted(reply.term, reply.id as usize);
+        }
+        if self.has_gotten_majority_votes() {
+            self.switch_to_leader();
+        }
+    }
+
+    fn handle_append_reply(&mut self, reply: AppendEntriesReply) {
+        if reply.term < self.term {
+            return;
+        }
+        if reply.term > self.term {
+            self.catch_up_term(reply.term);
+            return;
+        }
+        if !self.is_leader() {
+            return;
+        }
+        match reply.r#type.into() {
+            RequestType::Heartbeat => {}
+        }
+    }
+
+    fn vote_for(&mut self, id: usize) {
+        self.voted_terms.insert(self.term);
+        if id == self.me {
+            self.get_voted(self.term, id);
+        }
+    }
+
+    fn get_voted(&mut self, term: u64, id: usize) {
+        self.get_voted
+            .entry(term)
+            .or_insert(HashSet::new())
+            .insert(id);
+    }
+
+    fn has_gotten_majority_votes(&self) -> bool {
+        let votes = self.get_voted.get(&self.term).map_or(0, |s| s.len());
+        votes * 2 > self.n
+    }
+
+    fn switch_to_leader(&mut self) {
+        self.role = Leader;
+        self.send_heartbeat();
+    }
+
+    fn send_heartbeat(&mut self) {
+        let heartbeat_args = AppendEntriesArgs {
+            id: self.me as u64,
+            term: self.term,
+            r#type: RequestType::Heartbeat as i32,
+        };
+
+        for i in self.remote_servers.clone() {
+            let rx = self.send_append(i, heartbeat_args.clone());
+            let tx = self.tx.clone();
+            self.worker.spawn_ok(async move {
+                let reply = rx.await;
+                if let Ok(reply) = reply {
+                    let _ = tx.send(RaftMessage::AppendReply(reply));
+                }
+            });
+        }
+    }
+
+    fn increase_term(&mut self) {
+        self.term += 1;
+    }
+
+    fn catch_up_term(&mut self, new_term: u64) {
+        if new_term <= self.term {
+            error!(
+                "new term {} is not greater than current term {}",
+                new_term, self.term
+            );
+            return;
+        }
+        self.term = new_term;
+        self.role = Follower;
+        self.last_receive_heartbeat = Instant::now();
+    }
+
+    fn is_leader(&self) -> bool {
+        self.role == Leader
+    }
+
+    fn is_candidate(&self) -> bool {
+        self.role == Candidate
+    }
+
+    fn is_follower(&self) -> bool {
+        self.role == Follower
     }
 
     /// save Raft's persistent state to stable storage,
@@ -143,7 +444,7 @@ impl Raft {
         &self,
         server: usize,
         args: RequestVoteArgs,
-    ) -> Receiver<Result<RequestVoteReply>> {
+    ) -> oneshot::Receiver<RequestVoteReply> {
         // Your code here if you want the rpc becomes async.
         // Example:
         // ```
@@ -156,8 +457,40 @@ impl Raft {
         // });
         // rx
         // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
+        let (tx, rx) = oneshot::channel::<RequestVoteReply>();
+        let peer = &self.peers[server];
+        let peer_clone = peer.clone();
+        peer.spawn(async move {
+            for _ in 0..RPC_RETRY {
+                let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
+                if let Ok(res) = res {
+                    let _ = tx.send(res);
+                    return;
+                }
+            }
+        });
+        rx
+    }
+
+    fn send_append(
+        &mut self,
+        server: usize,
+        args: AppendEntriesArgs,
+    ) -> oneshot::Receiver<AppendEntriesReply> {
+        let (tx, rx) = oneshot::channel::<AppendEntriesReply>();
+        let peer = &self.peers[server];
+        let peer_clone = peer.clone();
+        peer.spawn(async move {
+            for _ in 0..RPC_RETRY {
+                let res = peer_clone.append_entries(&args).await.map_err(Error::Rpc);
+                if let Ok(res) = res {
+                    let _ = tx.send(res);
+                    return;
+                }
+            }
+        });
+        self.last_send_heartbeat = Instant::now();
+        rx
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -201,13 +534,25 @@ impl Raft {
         let _ = self.start(&0);
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
-        let _ = self.send_request_vote(0, Default::default());
         self.persist();
-        let _ = &self.state;
         let _ = &self.me;
         let _ = &self.persister;
         let _ = &self.peers;
     }
+}
+
+enum RaftMessage {
+    FollowerTimeout(Duration),
+    LeaderTimeout(Duration),
+
+    VoteRequest(RequestVoteArgs, AsyncOneshotSender<RequestVoteReply>),
+    VoteReply(RequestVoteReply),
+
+    AppendRequest(AppendEntriesArgs, AsyncOneshotSender<AppendEntriesReply>),
+    AppendReply(AppendEntriesReply),
+
+    QueryTerm(Sender<u64>),
+    QueryLeader(Sender<bool>),
 }
 
 // Choose concurrency paradigm.
@@ -226,14 +571,41 @@ impl Raft {
 // ```
 #[derive(Clone)]
 pub struct Node {
-    // Your code here.
+    worker: ThreadPool,
+    sender: Sender<RaftMessage>,
+    raft_daemon: Arc<JoinHandle<()>>,
 }
 
 impl Node {
     /// Create a new raft service.
-    pub fn new(raft: Raft) -> Node {
+    pub fn new(mut raft: Raft) -> Node {
         // Your code here.
-        crate::your_code_here(raft)
+        let tx = raft.tx.clone();
+        let worker = raft.worker.clone();
+
+        let follower_timeout_tx = tx.clone();
+        worker.spawn_ok(async move {
+            loop {
+                let duration = random_election_timeout();
+                Delay::new(duration).await;
+                let _ = follower_timeout_tx.send(RaftMessage::FollowerTimeout(duration));
+            }
+        });
+        let leader_timeout_tx = tx.clone();
+        worker.spawn_ok(async move {
+            loop {
+                let duration = Duration::from_millis(BASIC_TIMEOUT_MS);
+                Delay::new(duration).await;
+                let _ = leader_timeout_tx.send(RaftMessage::LeaderTimeout(duration));
+            }
+        });
+
+        let t = std::thread::spawn(move || raft.run());
+        Node {
+            worker,
+            sender: tx,
+            raft_daemon: Arc::new(t),
+        }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -263,7 +635,9 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.term
-        crate::your_code_here(())
+        let (tx, rx) = channel();
+        self.sender.send(RaftMessage::QueryTerm(tx)).unwrap();
+        rx.recv().unwrap()
     }
 
     /// Whether this peer believes it is the leader.
@@ -271,7 +645,9 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.leader_id == self.id
-        crate::your_code_here(())
+        let (tx, rx) = channel();
+        self.sender.send(RaftMessage::QueryLeader(tx)).unwrap();
+        rx.recv().unwrap()
     }
 
     /// The current state of this peer.
@@ -329,6 +705,47 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
-        crate::your_code_here(args)
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RaftMessage::VoteRequest(args, tx))
+            .is_err()
+        {
+            return Err(labrpc::Error::Other(
+                "send vote request to raft failed".into(),
+            ));
+        };
+        let reply = rx.await;
+        reply.map_err(|err| labrpc::Error::Recv(err))
+    }
+
+    async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RaftMessage::AppendRequest(args, tx))
+            .is_err()
+        {
+            return Err(labrpc::Error::Other(
+                "send append request to raft failed".into(),
+            ));
+        };
+        let reply = rx.await;
+        reply.map_err(|err| labrpc::Error::Recv(err))
+    }
+}
+
+fn random_election_timeout() -> Duration {
+    let mut random = rand::thread_rng();
+    let timeout_ms: u64 = random.gen::<u64>() % 100 + 10 + BASIC_TIMEOUT_MS;
+    Duration::from_millis(timeout_ms)
+}
+
+impl From<i32> for RequestType {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => RequestType::Heartbeat,
+            _ => unreachable!(),
+        }
     }
 }

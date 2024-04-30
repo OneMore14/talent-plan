@@ -8,7 +8,7 @@ enum Op {
     Append = 2;
 }
 
-/// Put or Append
+// Put or Append
 message PutAppendRequest {
     string key = 1;
     string value = 2;

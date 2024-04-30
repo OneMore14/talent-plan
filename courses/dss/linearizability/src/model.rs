@@ -1,7 +1,5 @@
-use std::cmp::PartialEq;
 use std::fmt::Debug;
 use std::fmt::Display;
-use std::marker::Send;
 
 #[derive(Debug)]
 pub enum Value<I: Debug, O: Debug> {

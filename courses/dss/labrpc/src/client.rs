@@ -68,7 +68,7 @@ impl Client {
             hooks: self.hooks.clone(),
         };
 
-        // Sends requests and waits responses.
+        // Sends requests and waits responses. send to network
         if self.sender.unbounded_send(rpc).is_err() {
             return Box::pin(future::err(Error::Stopped));
         }

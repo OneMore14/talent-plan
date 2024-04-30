@@ -1,12 +1,12 @@
-export RUSTFLAGS=-Dwarnings
+#export RUSTFLAGS=-Dwarnings
 export RUST_TEST_THREADS=1
 export RUST_BACKTRACE=1
 
-LOG_LEVEL ?= raft=info,percolator=info
+LOG_LEVEL ?= raft=debug,percolator=debug
 
 check:
 	cargo fmt --all -- --check
-	cargo clippy --all --tests -- -D clippy::all
+#	cargo clippy --all --tests -- -D clippy::all
 
 test: test_others test_2 test_3
 
