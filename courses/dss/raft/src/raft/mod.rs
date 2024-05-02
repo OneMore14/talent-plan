@@ -250,7 +250,7 @@ impl Raft {
             let tx = self.new_tx();
             self.worker.spawn_ok(async move {
                 Delay::new(next_fire).await;
-                let _ = tx.send(RaftMessage::FollowerTimeout(next_fire));
+                let _ = tx.send(RaftMessage::FollowerTimeout(duration));
             });
         } else {
             self.start_election();
