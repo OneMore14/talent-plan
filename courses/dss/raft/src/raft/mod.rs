@@ -1,13 +1,13 @@
+use futures::channel::mpsc::UnboundedSender;
+use futures::channel::oneshot;
+use futures::executor::ThreadPool;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ops::Add;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-use futures::channel::mpsc::UnboundedSender;
-use futures::channel::oneshot;
-use futures::executor::ThreadPool;
 
 use futures_timer::Delay;
 use rand::Rng;
@@ -65,10 +65,67 @@ impl State {
     }
 }
 
-const BASIC_TIMEOUT_MS: u64 = 100;
-const RPC_RETRY: usize = 10;
+const BASIC_TIMEOUT_MS: u64 = 150;
+const RPC_RETRY: usize = 20;
 
 type AsyncOneshotSender<T> = oneshot::Sender<T>;
+
+#[derive(Serialize, Deserialize)]
+struct RaftState {
+    term: u64,
+    voted_terms: HashMap<u64, u64>,
+    #[serde(serialize_with = "raft_serde::serialize_vec_entry")]
+    #[serde(deserialize_with = "raft_serde::deserialize_vec_entry")]
+    logs: Vec<AppendEntry>,
+    logs_vote: Vec<HashSet<u64>>,
+}
+
+mod raft_serde {
+    use crate::proto::raftpb::AppendEntry;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize_vec_entry<S: Serializer>(
+        vec: &[AppendEntry],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let vec: Vec<AppendEntrySerde> = vec.iter().map(|entry| entry.clone().into()).collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize_vec_entry<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<AppendEntry>, D::Error> {
+        let vec: Vec<AppendEntrySerde> = Deserialize::deserialize(deserializer)?;
+        Ok(vec.into_iter().map(|entry| entry.into()).collect())
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct AppendEntrySerde {
+        pub term: u64,
+        pub index: u64,
+        pub command: std::vec::Vec<u8>,
+    }
+
+    impl From<AppendEntry> for AppendEntrySerde {
+        fn from(value: AppendEntry) -> Self {
+            AppendEntrySerde {
+                term: value.term,
+                index: value.index,
+                command: value.command,
+            }
+        }
+    }
+
+    impl Into<AppendEntry> for AppendEntrySerde {
+        fn into(self) -> AppendEntry {
+            AppendEntry {
+                term: self.term,
+                index: self.index,
+                command: self.command,
+            }
+        }
+    }
+}
 
 // A single Raft peer.
 pub struct Raft {
@@ -186,7 +243,19 @@ impl Raft {
                 RaftMessage::SyncLog(server) => {
                     self.send_append(server, false);
                 }
+                RaftMessage::Stop => {
+                    break;
+                }
             }
+        }
+    }
+
+    fn get_state(&self) -> RaftState {
+        RaftState {
+            term: self.term,
+            voted_terms: self.voted_terms.clone(),
+            logs: self.logs.clone(),
+            logs_vote: self.logs_vote.clone(),
         }
     }
 
@@ -207,7 +276,6 @@ impl Raft {
             });
             return;
         }
-        self.refresh_follower_timeout();
         if vote_request.term > self.term {
             self.catch_up_term(vote_request.term);
         }
@@ -218,6 +286,7 @@ impl Raft {
             vote_request.id,
         ) {
             self.vote_for(vote_request.id as usize);
+            self.refresh_follower_timeout();
             true
         } else {
             false
@@ -230,6 +299,9 @@ impl Raft {
     }
 
     fn should_vote(&self, term: u64, last_index: u64, last_term: u64, id: u64) -> bool {
+        if !self.is_follower() {
+            return false;
+        }
         if let Some(&vote_for) = self.voted_terms.get(&term) {
             if vote_for != id {
                 return false;
@@ -245,51 +317,80 @@ impl Raft {
 
     fn handle_append_request(
         &mut self,
-        append_request: AppendEntriesArgs,
+        request: AppendEntriesArgs,
         tx: AsyncOneshotSender<AppendEntriesReply>,
     ) {
-        if append_request.term < self.term {
+        if request.term < self.term {
             let _ = tx.send(AppendEntriesReply {
                 id: self.me as u64,
                 term: self.term,
                 accept: false,
-                match_index: append_request.pre_log_index,
+                pre_log_index: request.pre_log_index,
+                matched_index: 0,
             });
             return;
         }
-        self.catch_up_term(append_request.term);
-        let accept = self.is_matched(append_request.pre_log_index, append_request.pre_log_term);
+        if request.term > self.term {
+            self.catch_up_term(request.term);
+        }
+        if self.is_leader() {
+            let _ = tx.send(AppendEntriesReply {
+                id: 0,
+                term: 0,
+                accept: false,
+                pre_log_index: 0,
+                matched_index: 0,
+            });
+            return;
+        }
+        self.refresh_follower_timeout();
+        let accept = self.is_matched(request.pre_log_index, request.pre_log_term);
         if accept {
-            let mut match_index = append_request.pre_log_index;
-            let len = self.logs.len() as u64;
-            for _ in (append_request.pre_log_index + 1)..len {
-                self.logs.pop();
-                self.logs_vote.pop();
+            let mut matched_index = request.pre_log_index as usize;
+            for (i, entry) in request.entries.iter().enumerate() {
+                let i = i + request.pre_log_index as usize + 1;
+                if i > self.logs.len() {
+                    break;
+                } else if i == self.logs.len() {
+                    self.logs.push(entry.clone());
+                    self.logs_vote.push(HashSet::new());
+                } else if i < self.logs.len() {
+                    self.logs[i] = entry.clone();
+                    self.logs_vote[i] = HashSet::new();
+                }
+                matched_index = i;
             }
-            for entry in append_request.entries {
-                self.logs.push(entry);
-                self.logs_vote.push(HashSet::new());
-                match_index += 1;
-            }
+
             let _ = tx.send(AppendEntriesReply {
                 id: self.me as u64,
                 term: self.term,
                 accept: true,
-                match_index,
+                matched_index: matched_index as u64,
+                pre_log_index: request.pre_log_index,
             });
+
+            if matched_index as u64 >= request.leader_commit
+                && request.leader_commit > self.commit_index
+            {
+                self.commit_index = request.leader_commit.min(self.logs.len() as u64 - 1);
+                self.commit();
+            }
         } else {
+            let len = self.logs.len() as u64;
+            for _ in request.pre_log_index..len {
+                self.logs.pop();
+                self.logs_vote.pop();
+            }
+            assert!(!self.logs.is_empty(), "empty log");
             let _ = tx.send(AppendEntriesReply {
                 id: self.me as u64,
                 term: self.term,
                 accept: false,
-                match_index: append_request.pre_log_index,
+                pre_log_index: request.pre_log_index,
+                matched_index: 0,
             });
         }
-
-        if accept && append_request.leader_commit > self.commit_index {
-            self.commit_index = append_request.leader_commit.min(self.logs.len() as u64 - 1);
-            self.commit()
-        }
+        self.persist();
     }
 
     fn is_matched(&self, index: u64, term: u64) -> bool {
@@ -329,6 +430,7 @@ impl Raft {
     }
 
     fn start_election(&mut self) {
+        assert!(!self.is_leader(), "leader start election");
         self.increase_term();
         self.role = Candidate;
         self.vote_for(self.me);
@@ -385,18 +487,27 @@ impl Raft {
         }
         let server = reply.id as usize;
         if reply.accept {
-            self.match_index[server] = reply.match_index; //self.match_index[server].max(reply.match_index);
-            self.next_index[server] = (self.match_index[server] + 1).min(self.logs.len() as u64);
-            let idx = reply.match_index as usize;
-            if self.logs.get(idx).map_or(0, |entry| entry.term) == self.term {
-                self.logs_vote[idx].insert(reply.id);
-                if (self.logs_vote[idx].len() * 2 > self.n) && self.commit_index < idx as u64 {
-                    self.commit_index = idx as u64;
-                    self.commit();
+            self.match_index[server] = self.match_index[server].max(reply.matched_index);
+            self.next_index[server] = (self.match_index[server] + 2).min(self.highest_index());
+            let idx = reply.matched_index as usize;
+            for i in (0..=idx).rev() {
+                if self.logs[i].term == self.term {
+                    self.logs_vote[i].insert(reply.id);
+                    self.logs_vote[i].insert(self.me as u64);
+                    if (self.logs_vote[i].len() * 2 > self.n) && self.commit_index < i as u64 {
+                        self.commit_index = i as u64;
+                        self.commit();
+                        break;
+                    }
+                } else {
+                    break;
                 }
             }
         } else {
-            self.next_index[server] = (self.next_index[server] - 1).max(1);
+            self.next_index[server] = self.next_index[server]
+                .checked_sub(20)
+                .unwrap_or(1)
+                .max(self.match_index[server] + 1);
         }
 
         if self.next_index[server] < self.highest_index() {
@@ -426,6 +537,7 @@ impl Raft {
         if id == self.me {
             self.get_voted(self.term, id);
         }
+        self.persist();
     }
 
     fn get_voted(&mut self, term: u64, id: usize) {
@@ -438,6 +550,7 @@ impl Raft {
     }
 
     fn switch_to_leader(&mut self) {
+        assert!(!self.is_leader(), "error: leader switch to leader");
         self.role = Leader;
         for s in &mut self.logs_vote {
             s.clear();
@@ -455,7 +568,7 @@ impl Raft {
     }
 
     fn catch_up_term(&mut self, new_term: u64) {
-        if new_term < self.term {
+        if new_term <= self.term {
             error!(
                 "new term {} is not greater than current term {}",
                 new_term, self.term
@@ -465,6 +578,7 @@ impl Raft {
         self.term = new_term;
         self.role = Follower;
         self.last_receive_heartbeat = Instant::now();
+        self.persist();
     }
 
     fn is_leader(&self) -> bool {
@@ -488,24 +602,21 @@ impl Raft {
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+        let state = self.get_state();
+        let s = serde_json::to_string(&state).unwrap();
+        self.persister.save_raft_state(s.into_bytes());
     }
 
     /// restore previously persisted state.
     fn restore(&mut self, data: &[u8]) {
         if data.is_empty() {
-            // bootstrap without any state?
+            return;
         }
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
+        let state: RaftState = serde_json::from_slice(data).unwrap();
+        self.term = state.term;
+        self.logs = state.logs;
+        self.voted_terms = state.voted_terms;
+        self.logs_vote = state.logs_vote;
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -562,7 +673,7 @@ impl Raft {
         let pre_log_index = self.logs[next_index - 1].index;
         let pre_log_term = self.logs[next_index - 1].term;
         let entries: Vec<_> = (next_index..self.logs.len())
-            .take(10)
+            .take(20)
             .map(|i| self.logs[i].clone())
             .collect();
         if entries.len() < 4 && !heartbeat {
@@ -581,7 +692,7 @@ impl Raft {
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
         peer.spawn(async move {
-            for _ in 0..RPC_RETRY {
+            for _ in 0.. {
                 let res = peer_clone.append_entries(&args).await.map_err(Error::Rpc);
                 if let Ok(res) = res {
                     let _ = tx.send(res);
@@ -607,7 +718,6 @@ impl Raft {
         }
         let term = self.term;
         let index = self.highest_index();
-
         if let Err(err) = tx.send(Ok((index, term))) {
             error!("raft start end result failed {}", err);
             return;
@@ -620,7 +730,7 @@ impl Raft {
         self.logs.push(entry);
         self.logs_vote.push(HashSet::new());
         self.logs_vote.last_mut().unwrap().insert(self.me as u64);
-
+        self.persist();
         for i in self.remote_servers.clone() {
             self.send_append(i, false);
         }
@@ -648,10 +758,6 @@ impl Raft {
     pub fn __suppress_deadcode(&mut self) {
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
-        self.persist();
-        let _ = &self.me;
-        let _ = &self.persister;
-        let _ = &self.peers;
     }
 }
 
@@ -671,6 +777,8 @@ enum RaftMessage {
     StartCommand(Vec<u8>, Sender<Result<(u64, u64)>>),
 
     SyncLog(usize),
+
+    Stop,
 }
 
 // Choose concurrency paradigm.
@@ -754,10 +862,11 @@ impl Node {
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         let (tx, rx) = channel();
-        self.sender
-            .send(RaftMessage::StartCommand(buf, tx))
-            .expect("node sends command failed");
-        rx.recv().unwrap()
+        let _ = self.sender.send(RaftMessage::StartCommand(buf, tx));
+        match rx.recv() {
+            Ok(reply) => reply,
+            Err(_) => Err(Error::Rpc(labrpc::Error::Stopped)),
+        }
     }
 
     /// The current term of this peer.
@@ -798,6 +907,7 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        let _ = self.sender.send(RaftMessage::Stop);
     }
 
     /// A service wants to switch to snapshot.  
@@ -867,7 +977,7 @@ impl RaftService for Node {
 
 fn random_election_timeout() -> Duration {
     let mut random = rand::thread_rng();
-    let timeout_ms: u64 = random.gen::<u64>() % 100 + BASIC_TIMEOUT_MS;
+    let timeout_ms: u64 = random.gen::<u64>() % 200 + BASIC_TIMEOUT_MS + 20;
     Duration::from_millis(timeout_ms)
 }
 
